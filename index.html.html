@@ -796,12 +796,14 @@ if(filmCta){
    A Catch Hook URL is safe to sit in this file — it only accepts data, it
    cannot read anything out of your account.
    =========================================================================== */
-var WEBHOOK_URL = ""; // <-- paste your Zapier Catch Hook URL between the quotes
+var TINTOS_API        = "https://tintos.onrender.com/v1";
+var TINTOS_INTAKE_KEY = "tk_website_PASTE_YOUR_KEY_FROM_PART_1_STEP_3"; // <-- primary delivery, straight into TintOS
+var WEBHOOK_URL = ""; // <-- optional: paste your Zapier Catch Hook URL between the quotes for a mirror copy
 
-if(!WEBHOOK_URL && typeof console !== "undefined" && console.warn){
-  console.warn("Tint Tech KC: WEBHOOK_URL is empty. Quote requests will fall back to "
-    + "text/email links instead of being delivered automatically. See the setup "
-    + "notes above this line in the source.");
+if(!TINTOS_INTAKE_KEY && typeof console !== "undefined" && console.warn){
+  console.warn("Tint Tech KC: TINTOS_INTAKE_KEY is empty. Quote requests will fall back to "
+    + "text/email links (or the Zapier mirror, if WEBHOOK_URL is set) instead of reaching "
+    + "the CRM automatically. See the setup notes above this line in the source.");
 }
 
 /* --- the script the chat follows ---------------------------------------- */
@@ -945,6 +947,50 @@ function deliver(payload){
   }).then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r; });
 }
 
+// TintOS's intake DTO runs a strict whitelist -- an unexpected key rejects
+// the whole request -- so this only sends fields the receiver validates
+// (see apps/api/src/modules/intake/dto/submit-lead.dto.ts in the TintOS repo).
+function buildTintOsPayload(a, source){
+  var segment = a.propertyType === "Business" ? "commercial"
+    : a.propertyType === "Home" ? "residential" : undefined;
+  var notes = [];
+  if(a.problem) notes.push("Wants fixed: " + a.problem);
+  if(a.glassAmount) notes.push("Glass: " + a.glassAmount);
+  if(a.timing) notes.push("Requested timing: " + a.timing);
+  if(a.freeText) notes.push(a.freeText);
+  if(a.address) notes.push("Address: " + a.address);
+  notes.push("Source: " + source);
+  return {
+    intakeKey: TINTOS_INTAKE_KEY,
+    name: a.name || undefined,
+    phone: a.phone || undefined,
+    email: a.email || undefined,
+    city: a.city || undefined,
+    propertyType: a.propertyType || undefined,
+    segment: segment,
+    message: notes.join(" | ").slice(0, 5000) || undefined
+  };
+}
+
+function deliverToTintOs(payload){
+  if(!TINTOS_INTAKE_KEY){ return Promise.reject(new Error("TintOS not configured")); }
+  var clean = {};
+  Object.keys(payload).forEach(function(k){ if(payload[k] !== undefined && payload[k] !== "") clean[k] = payload[k]; });
+  return fetch(TINTOS_API + "/public/leads", {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(clean)
+  }).then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r; });
+}
+
+/* Primary delivery: TintOS straight into the CRM. The Zapier mirror (if
+   configured) fires in parallel and never blocks or fails the primary path.
+   Only when TintOS itself fails does the caller fall back to SMS/mailto. */
+function deliverLead(rawAnswers, source){
+  if(WEBHOOK_URL) deliver(buildPayload(rawAnswers, source)).catch(function(){});
+  return deliverToTintOs(buildTintOsPayload(rawAnswers, source));
+}
+
 function plainText(p){
   return ["New quote request — Tint Tech KC","",
     "Name:    " + p.name, "Phone:   " + p.mobilePhone, "Email:   " + p.email,
@@ -994,7 +1040,7 @@ function finish(){
   say([a.propertyType, a.problem, a.glassAmount, a.timing].filter(Boolean).join(" · "));
   var payload = buildPayload(a, "Website chat");
 
-  deliver(payload).then(function(){
+  deliverLead(a, "Website chat").then(function(){
     say("Sent. We'll call " + (a.phone || "you") + " to lock in a time — usually the same business day.");
   }).catch(function(){
     say("One tap and this goes straight to the office — text is fastest.");
@@ -1040,14 +1086,15 @@ document.getElementById("quoteform").addEventListener("submit", function(e){
   btn.disabled = true; btn.textContent = "Sending...";
   status.style.color = ""; status.textContent = "Sending your request...";
 
-  var payload = buildPayload({
+  var answers = {
     name:name, phone:phone, email:email,
     address:"", city:get("qcity"),
     propertyType:document.getElementById("qtype").value,
     freeText:get("qmsg")
-  }, "Website quote form");
+  };
+  var payload = buildPayload(answers, "Website quote form");
 
-  deliver(payload).then(function(){
+  deliverLead(answers, "Website quote form").then(function(){
     btn.textContent = "Request sent";
     status.style.color = "var(--volt)";
     status.textContent = "Got it — we'll reply the same business day.";
